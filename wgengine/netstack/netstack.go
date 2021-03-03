@@ -381,18 +381,53 @@ func (ns *Impl) acceptUDP(r *udp.ForwarderRequest) {
 		ns.logf("Could not create endpoint, exiting")
 		return
 	}
+	localAddr, err := ep.GetLocalAddress()
+	if err != nil {
+		return
+	}
 	c := gonet.NewUDPConn(ns.ipstack, &wq, ep)
-	go echoUDP(c)
+	go ns.forwardUDP(c, &wq, localAddr)
 }
 
-func echoUDP(c *gonet.UDPConn) {
-	buf := make([]byte, 1500)
-	for {
-		n, err := c.Read(buf)
-		if err != nil {
-			break
+func (ns *Impl) forwardUDP(client *gonet.UDPConn, wq *waiter.Queue, localAddr tcpip.FullAddress) {
+	defer client.Close()
+	port := localAddr.Port
+	ns.logf("[v2] netstack: forwarding incoming UDP connection on port %v", port)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	waitEntry, notifyCh := waiter.NewChannelEntry(nil)
+	wq.EventRegister(&waitEntry, waiter.EventHUp)
+	defer wq.EventUnregister(&waitEntry)
+	done := make(chan bool)
+	// netstack doesn't close the notification channel automatically if there was no
+	// hup signal, so we close done after we're done to not leak the goroutine below.
+	defer close(done)
+	go func() {
+		select {
+		case <-notifyCh:
+		case <-done:
 		}
-		c.Write(buf[:n])
+		cancel()
+	}()
+	var stdDialer net.Dialer
+	server, err := stdDialer.DialContext(ctx, "udp", net.JoinHostPort("localhost", strconv.Itoa(int(port))))
+	if err != nil {
+		ns.logf("netstack: could not connect to local UDP server on port %v: %v", port, err)
+		return
 	}
-	c.Close()
+	defer server.Close()
+	connClosed := make(chan error, 2)
+	go func() {
+		_, err := io.Copy(server, client)
+		connClosed <- err
+	}()
+	go func() {
+		_, err := io.Copy(client, server)
+		connClosed <- err
+	}()
+	err = <-connClosed
+	if err != nil {
+		ns.logf("proxy connection closed with error: %v", err)
+	}
+	ns.logf("[v2] netstack: forwarder UDP connection on port %v closed", port)
 }
