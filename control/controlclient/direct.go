@@ -37,6 +37,7 @@ import (
 	"tailscale.com/log/logheap"
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/dnsfallback"
+	"tailscale.com/net/interfaces"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/tlsdial"
 	"tailscale.com/net/tshttpproxy"
@@ -1147,8 +1148,19 @@ func ipForwardingBroken(routes []netaddr.IPPrefix) bool {
 		return false
 	}
 
+	localIPs := map[netaddr.IP]bool{}
+	interfaces.ForeachInterfaceAddress(func(_ interfaces.Interface, pfx netaddr.IPPrefix) {
+		localIPs[pfx.IP] = true
+	})
+
 	v4Routes, v6Routes := false, false
 	for _, r := range routes {
+		// It's possible to advertise a route to one of the local
+		// machine's local IPs. IP forwarding isn't required for this
+		// to work, so we shouldn't warn for such exports.
+		if r.IsSingleIP() && localIPs[r.IP] {
+			continue
+		}
 		if r.IP.Is4() {
 			v4Routes = true
 		} else {
