@@ -397,12 +397,12 @@ func (ns *Impl) acceptUDP(r *udp.ForwarderRequest) {
 func (ns *Impl) forwardUDP(client *gonet.UDPConn, wq *waiter.Queue, clientLocalAddr, clientRemoteAddr tcpip.FullAddress) {
 	port := clientLocalAddr.Port
 	ns.logf("[v2] netstack: forwarding incoming UDP connection on port %v", port)
-	serverLocalAddr := &net.UDPAddr{Port: int(clientRemoteAddr.Port)}
-	serverRemoteAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: int(port)}
-	server, err := net.ListenUDP("udp", serverLocalAddr)
+	backendLocalAddr := &net.UDPAddr{Port: int(clientRemoteAddr.Port)}
+	backendRemoteAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: int(port)}
+	backendConn, err := net.ListenUDP("udp4", backendLocalAddr)
 	if err != nil {
 		ns.logf("netstack: could not bind local port %v: %v, trying again with random port", clientRemoteAddr.Port, err)
-		server, err = net.ListenUDP("udp", nil)
+		backendConn, err = net.ListenUDP("udp4", nil)
 		if err != nil {
 			ns.logf("netstack: could not connect to local UDP server on port %v: %v", port, err)
 			return
@@ -410,41 +410,47 @@ func (ns *Impl) forwardUDP(client *gonet.UDPConn, wq *waiter.Queue, clientLocalA
 	}
 	var cancels [2]context.CancelFunc
 	timer := time.AfterFunc(2*time.Minute, func() {
+		ns.logf("netstack: forwarder UDP connection on port %v closed", port)
 		for _, c := range cancels {
 			if c != nil {
 				c()
 			}
 		}
-		ns.logf("netstack: forwarder UDP connection on port %v closed", port)
+		client.Close()
+		backendConn.Close()
 	})
+	extend := func() {
+		timer.Reset(2 * time.Minute)
+	}
 	cancels[0] = startPacketCopy(client, &net.UDPAddr{
 		IP:   net.ParseIP(clientRemoteAddr.Addr.String()),
 		Port: int(clientRemoteAddr.Port),
-	}, server, ns.logf, timer)
-	cancels[1] = startPacketCopy(server, serverRemoteAddr, client, ns.logf, timer)
+	}, backendConn, ns.logf, extend)
+	cancels[1] = startPacketCopy(backendConn, backendRemoteAddr, client, ns.logf, extend)
 
 }
 
-func startPacketCopy(dst net.PacketConn, dstAddr net.Addr, src net.PacketConn, logf logger.Logf, timer *time.Timer) context.CancelFunc {
+func startPacketCopy(dst net.PacketConn, dstAddr net.Addr, src net.PacketConn, logf logger.Logf, extend func()) context.CancelFunc {
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
+		pkt := make([]byte, mtu)
 		for {
 			select {
 			case <-ctx.Done():
-				break
+				return
 			default:
-				pkt := make([]byte, mtu)
 				n, srcAddr, err := src.ReadFrom(pkt)
 				if err != nil {
 					logf("read packet from %s failed: %v", srcAddr, err)
-					continue
+					return
 				}
 				_, err = dst.WriteTo(pkt[:n], dstAddr)
 				if err != nil {
 					logf("write packet to %s failed: %v", dstAddr, err)
+					return
 				}
 				logf("wrote UDP packet %s -> %s", srcAddr, dstAddr)
-				timer.Reset(2 * time.Minute)
+				extend()
 			}
 		}
 	}()
