@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -58,6 +59,7 @@ type Impl struct {
 }
 
 const nicID = 1
+const mtu = 1500
 
 // Create creates and populates a new Impl.
 func Create(logf logger.Logf, tundev *tstun.TUN, e wgengine.Engine, mc *magicsock.Conn) (*Impl, error) {
@@ -77,7 +79,6 @@ func Create(logf logger.Logf, tundev *tstun.TUN, e wgengine.Engine, mc *magicsoc
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol4, icmp.NewProtocol6},
 	})
-	const mtu = 1500
 	linkEP := channel.New(512, mtu, "")
 	if tcpipProblem := ipstack.CreateNIC(nicID, linkEP); tcpipProblem != nil {
 		return nil, fmt.Errorf("could not create netstack NIC: %v", tcpipProblem)
@@ -385,49 +386,67 @@ func (ns *Impl) acceptUDP(r *udp.ForwarderRequest) {
 	if err != nil {
 		return
 	}
-	c := gonet.NewUDPConn(ns.ipstack, &wq, ep)
-	go ns.forwardUDP(c, &wq, localAddr)
-}
-
-func (ns *Impl) forwardUDP(client *gonet.UDPConn, wq *waiter.Queue, localAddr tcpip.FullAddress) {
-	defer client.Close()
-	port := localAddr.Port
-	ns.logf("[v2] netstack: forwarding incoming UDP connection on port %v", port)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	waitEntry, notifyCh := waiter.NewChannelEntry(nil)
-	wq.EventRegister(&waitEntry, waiter.EventHUp)
-	defer wq.EventUnregister(&waitEntry)
-	done := make(chan bool)
-	// netstack doesn't close the notification channel automatically if there was no
-	// hup signal, so we close done after we're done to not leak the goroutine below.
-	defer close(done)
-	go func() {
-		select {
-		case <-notifyCh:
-		case <-done:
-		}
-		cancel()
-	}()
-	var stdDialer net.Dialer
-	server, err := stdDialer.DialContext(ctx, "udp", net.JoinHostPort("localhost", strconv.Itoa(int(port))))
+	remoteAddr, err := ep.GetRemoteAddress()
 	if err != nil {
-		ns.logf("netstack: could not connect to local UDP server on port %v: %v", port, err)
 		return
 	}
-	defer server.Close()
-	connClosed := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(server, client)
-		connClosed <- err
-	}()
-	go func() {
-		_, err := io.Copy(client, server)
-		connClosed <- err
-	}()
-	err = <-connClosed
+	c := gonet.NewUDPConn(ns.ipstack, &wq, ep)
+	go ns.forwardUDP(c, &wq, localAddr, remoteAddr)
+}
+
+func (ns *Impl) forwardUDP(client *gonet.UDPConn, wq *waiter.Queue, clientLocalAddr, clientRemoteAddr tcpip.FullAddress) {
+	port := clientLocalAddr.Port
+	ns.logf("[v2] netstack: forwarding incoming UDP connection on port %v", port)
+	serverLocalAddr := &net.UDPAddr{Port: int(clientRemoteAddr.Port)}
+	serverRemoteAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: int(port)}
+	server, err := net.ListenUDP("udp", serverLocalAddr)
 	if err != nil {
-		ns.logf("proxy connection closed with error: %v", err)
+		ns.logf("netstack: could not bind local port %v: %v, trying again with random port", clientRemoteAddr.Port, err)
+		server, err = net.ListenUDP("udp", nil)
+		if err != nil {
+			ns.logf("netstack: could not connect to local UDP server on port %v: %v", port, err)
+			return
+		}
 	}
-	ns.logf("[v2] netstack: forwarder UDP connection on port %v closed", port)
+	var cancels [2]context.CancelFunc
+	timer := time.AfterFunc(2*time.Minute, func() {
+		for _, c := range cancels {
+			if c != nil {
+				c()
+			}
+		}
+		ns.logf("netstack: forwarder UDP connection on port %v closed", port)
+	})
+	cancels[0] = startPacketCopy(client, &net.UDPAddr{
+		IP:   net.ParseIP(clientRemoteAddr.Addr.String()),
+		Port: int(clientRemoteAddr.Port),
+	}, server, ns.logf, timer)
+	cancels[1] = startPacketCopy(server, serverRemoteAddr, client, ns.logf, timer)
+
+}
+
+func startPacketCopy(dst net.PacketConn, dstAddr net.Addr, src net.PacketConn, logf logger.Logf, timer *time.Timer) context.CancelFunc {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				break
+			default:
+				pkt := make([]byte, mtu)
+				n, srcAddr, err := src.ReadFrom(pkt)
+				if err != nil {
+					logf("read packet from %s failed: %v", srcAddr, err)
+					continue
+				}
+				_, err = dst.WriteTo(pkt[:n], dstAddr)
+				if err != nil {
+					logf("write packet to %s failed: %v", dstAddr, err)
+				}
+				logf("wrote UDP packet %s -> %s", srcAddr, dstAddr)
+				timer.Reset(2 * time.Minute)
+			}
+		}
+	}()
+	return cancel
 }
