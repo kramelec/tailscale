@@ -441,12 +441,16 @@ func startPacketCopy(dst net.PacketConn, dstAddr net.Addr, src net.PacketConn, l
 			default:
 				n, srcAddr, err := src.ReadFrom(pkt)
 				if err != nil {
-					logf("read packet from %s failed: %v", srcAddr, err)
+					if ctx.Err() == nil {
+						logf("read packet from %s failed: %v", srcAddr, err)
+					}
 					return
 				}
 				_, err = dst.WriteTo(pkt[:n], dstAddr)
 				if err != nil {
-					logf("write packet to %s failed: %v", dstAddr, err)
+					if ctx.Err() == nil {
+						logf("write packet to %s failed: %v", dstAddr, err)
+					}
 					return
 				}
 				logf("wrote UDP packet %s -> %s", srcAddr, dstAddr)
